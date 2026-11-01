@@ -13,7 +13,7 @@ Tab.__index = Tab
 local Theme = {
     Background = Color3.fromRGB(20, 20, 25),
     Sidebar    = Color3.fromRGB(15, 15, 20),
-    Accent     = Color3.fromRGB(80, 200, 120),   -- "potassium" green
+    Accent     = Color3.fromRGB(80, 200, 120),
     Text       = Color3.fromRGB(240, 240, 240),
     SubText    = Color3.fromRGB(150, 150, 160),
     Element    = Color3.fromRGB(35, 35, 45),
@@ -49,10 +49,22 @@ local function safeCallback(fn)
     return function() end
 end
 
+local function getEnv()
+    return (type(getgenv) == "function" and getgenv()) or _G
+end
+
 -- ---------- Window ----------
 
 function Potasium:CreateWindow(config)
     config = config or {}
+
+    -- Clean up any previous instance from a prior execution of this script.
+    local env = getEnv()
+    if env.__Potasium_Current and type(env.__Potasium_Current.Unload) == "function" then
+        pcall(function() env.__Potasium_Current:Unload() end)
+    end
+    env.__Potasium_Current = nil
+
     local self = setmetatable({}, Potasium)
     self.Title        = config.Title or "Potasium"
     self.Subtitle     = config.Subtitle or ""
@@ -61,6 +73,7 @@ function Potasium:CreateWindow(config)
     self.FlagObjects  = {}
     self.Tabs         = {}
     self.SelectedTab  = nil
+    self.Destroyed    = false
     self._order       = 0
     self._conns       = {}
 
@@ -109,6 +122,7 @@ function Potasium:CreateWindow(config)
         Parent = main,
         Size = UDim2.new(1, 0, 0, 48),
         BackgroundTransparency = 1,
+        ZIndex = 5,
     })
     corner(titleBar, 10)
 
@@ -118,6 +132,7 @@ function Potasium:CreateWindow(config)
         Text = self.Title, TextColor3 = Theme.Text, TextSize = 16,
         Font = Enum.Font.GothamBold,
         TextXAlignment = Enum.TextXAlignment.Left,
+        ZIndex = 6,
     })
     if self.Subtitle ~= "" then
         new("TextLabel", {
@@ -126,6 +141,7 @@ function Potasium:CreateWindow(config)
             Text = self.Subtitle, TextColor3 = Theme.SubText, TextSize = 11,
             Font = Enum.Font.Gotham,
             TextXAlignment = Enum.TextXAlignment.Left,
+            ZIndex = 6,
         })
     end
 
@@ -135,9 +151,10 @@ function Potasium:CreateWindow(config)
         BackgroundColor3 = Theme.Element, BorderSizePixel = 0,
         Text = "X", TextColor3 = Theme.SubText, TextSize = 12,
         Font = Enum.Font.GothamBold, AutoButtonColor = false,
+        ZIndex = 10,
     })
     corner(close, 6)
-    close.MouseButton1Click:Connect(function() self:Destroy() end)
+    close.MouseButton1Click:Connect(function() self:Unload() end)
 
     -- Dragging
     local dragging, dragStart, startPos
@@ -191,6 +208,12 @@ function Potasium:CreateWindow(config)
     })
 
     self.Sidebar, self.PageContainer = sidebar, pages
+
+    -- Default visibility hotkey (RightShift). Override with Window:SetKeybind(...)
+    self:SetKeybind(Enum.KeyCode.RightShift)
+
+    -- Register so a re-execution cleans this up automatically.
+    env.__Potasium_Current = self
     return self
 end
 
@@ -336,6 +359,7 @@ function Tab:Toggle(config)
         BackgroundTransparency = 1, Text = "",
     })
     hit.MouseButton1Click:Connect(function()
+        if self.Window.Destroyed then return end
         state = not state
         paint(true)
         if flag then self.Window.Flags[flag] = state end
@@ -451,6 +475,7 @@ function Tab:Slider(config)
         BackgroundTransparency = 1, Text = "",
     })
     hit.InputBegan:Connect(function(input)
+        if self.Window.Destroyed then return end
         if input.UserInputType == Enum.UserInputType.MouseButton1 then
             dragging = true
             state = fromX(input.Position.X)
@@ -520,15 +545,90 @@ function Potasium:LoadConfig(name)
     return true
 end
 
--- ---------- Cleanup ----------
+-- ---------- Visibility / Keybind ----------
+
+function Potasium:SetVisible(visible)
+    if self.Destroyed or not self.Gui then return end
+    self.Gui.Enabled = visible and true or false
+end
+
+function Potasium:ToggleVisible()
+    if self.Destroyed or not self.Gui then return end
+    self.Gui.Enabled = not self.Gui.Enabled
+end
+
+function Potasium:SetKeybind(keyCode)
+    if self._keybindConn then
+        pcall(function() self._keybindConn:Disconnect() end)
+        self._keybindConn = nil
+    end
+    self.Keybind = keyCode or Enum.KeyCode.RightShift
+    self._keybindConn = UserInputService.InputBegan:Connect(function(input, processed)
+        if processed then return end
+        if self.Destroyed then return end
+        if input.KeyCode == self.Keybind then
+            self:ToggleVisible()
+        end
+    end)
+    return self._keybindConn
+end
+
+-- ---------- Destroy / Unload ----------
 
 function Potasium:Destroy()
+    if self.Destroyed then return end
+    self.Destroyed = true
+
+    -- 1. Stop the visibility keybind
+    if self._keybindConn then
+        pcall(function() self._keybindConn:Disconnect() end)
+        self._keybindConn = nil
+    end
+
+    -- 2. Disconnect every tracked connection
     for _, c in ipairs(self._conns) do
         pcall(function() c:Disconnect() end)
     end
     self._conns = {}
-    if self.Gui then
-        pcall(function() self.Gui:Destroy() end)
+
+    -- 3. Remove the GUI with a fallback chain
+    local gui = self.Gui
+    if gui then
+        -- Instant kill: disable first so it's non-interactive regardless
+        pcall(function() gui.Enabled = false end)
+
+        -- Try to unparent (this is usually what unblocks :Destroy())
+        local unparented = pcall(function() gui.Parent = nil end)
+
+        if not unparented then
+            pcall(function() gui:Remove() end)
+        end
+
+        -- Now destroy (works whether orphaned or not)
+        pcall(function() gui:Destroy() end)
+
+        -- Last resort: if it's somehow still parented, move then destroy
+        local stillParented = false
+        pcall(function() stillParented = gui.Parent ~= nil end)
+        if stillParented then
+            pcall(function()
+                gui.Parent = Players.LocalPlayer:WaitForChild("PlayerGui")
+            end)
+            pcall(function() gui:Destroy() end)
+        end
+    end
+
+    -- 4. Nuke every reference so GC + re-load is clean
+    self.Gui, self.MainFrame = nil, nil
+    self.Sidebar, self.PageContainer = nil, nil
+    self.Tabs, self.FlagObjects, self.Flags = {}, {}, {}
+end
+
+function Potasium:Unload()
+    self:Destroy()
+    local env = getEnv()
+    if env.__Potasium_Current == self then
+        env.__Potasium_Current = nil
     end
 end
 
